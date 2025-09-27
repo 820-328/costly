@@ -1,0 +1,5 @@
+streamlit>=1.36
+requests>=2.31
+pandas>=2.2
+tzdata>=2024.1
+python-dateutil>=2.9
