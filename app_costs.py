@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 from datetime import datetime, date, timezone
 from dateutil import tz, relativedelta
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Any  # ← Any を追加
 
 import requests
 import pandas as pd
@@ -108,28 +108,49 @@ def month_range_from_months(start_month: date, end_month: date) -> Tuple[int, in
 # Costs API
 # ==============================
 @st.cache_data(ttl=60 * 5)
-def call_costs_api(start_ts: int, end_ts: Optional[int] = None, limit: int = 90) -> List[Dict]:
-    """日次バケットでページング取得（Python側で月次集計する設計）"""
-    params = {"start_time": start_ts, "bucket_width": "1d", "limit": limit}
+def call_costs_api(start_ts: int, end_ts: Optional[int] = None, limit: int = 180) -> List[Dict]:
+    """
+    Costs API をページング取得（日次バケット）。
+    - 新仕様: next_page クエリでページ送り
+    - 互換: もし400が返ったら1回だけ page= でリトライ
+    """
+    limit = max(1, min(limit, 180))
+    base_params: Dict[str, Any] = {"start_time": start_ts, "bucket_width": "1d", "limit": limit}
     if end_ts:
-        params["end_time"] = end_ts
+        base_params["end_time"] = end_ts
 
     all_buckets: List[Dict] = []
-    page: Optional[str] = None
+    cursor: Optional[str] = None
+
     while True:
-        p = params.copy()
-        if page:
-            p["page"] = page
-        resp = requests.get(COSTS_URL, headers=HEADERS, params=p, timeout=30)
+        params = dict(base_params)
+        if cursor:
+            # 新仕様
+            params["next_page"] = cursor
+
+        resp = requests.get(COSTS_URL, headers=HEADERS, params=params, timeout=30)
+
+        # 権限系
         if resp.status_code in (401, 403):
-            raise PermissionError("Costs API へのアクセスが拒否されました。Admin Key（読み取り専用）が必要です。")
+            raise PermissionError("Costs API へのアクセスが拒否されました。Admin Key（読み取り専用）が必要です.")
+
+        # 互換フォールバック：next_page 指定で 400 が出た場合のみ 1回 page= で試す
+        if resp.status_code == 400 and cursor and ("next_page" in params):
+            params_fb = dict(base_params)
+            params_fb["page"] = cursor
+            resp = requests.get(COSTS_URL, headers=HEADERS, params=params_fb, timeout=30)
+
         resp.raise_for_status()
         payload = resp.json()
+
         all_buckets.extend(payload.get("data", []))
-        if not (payload.get("has_more") and payload.get("next_page")):
+        nxt = payload.get("next_page")
+        if not (payload.get("has_more") and nxt):
             break
-        page = payload.get("next_page")
-        time.sleep(0.5)
+
+        cursor = nxt
+        time.sleep(0.5)  # rate limit 配慮
+
     return all_buckets
 
 def to_daily_df(buckets: List[Dict]) -> pd.DataFrame:
@@ -171,7 +192,7 @@ with st.expander("設定 / オプション", expanded=False):
         min_value=0.0, value=0.0, step=0.01,
         help="自動取得に失敗時はキャッシュ→警告。必要ならここで手動入力。"
     )
-    # ✅ 単一のラジオで表示モード切替（デフォルトは「日別明細」）
+    # 単一のラジオで表示モード切替（デフォルトは「日別明細」）
     display_mode = st.radio("表示モード", ["日別明細", "月別サマリ"], index=0, horizontal=True)
 
 if not OPENAI_ADMIN_KEY:
