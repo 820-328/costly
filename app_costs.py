@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Costly — OpenAI 今月のAPI利用料金ダッシュボード（Streamlit）改訂版
-- ① グラフ縦軸に USD($) ラベル
-- ② テーブルに cost_jpy 列
-- ③ 為替レート取得のフォールバック & キャッシュ（.rate_cache.json）
+Costly — OpenAI API利用料金ダッシュボード（履歴対応版）
+- 期間選択: 今月 / 任意の期間（開始月〜終了月）
+- タブ: 月別 / 日別
+- どちらも USDグラフ(縦軸ラベルつき), cost_jpy列, CSVダウンロード
 """
 
 import os
@@ -11,8 +11,9 @@ import time
 import math
 import json
 from pathlib import Path
-from datetime import datetime, timezone
-from dateutil import tz
+from datetime import datetime, date, timezone
+from dateutil import tz, relativedelta
+from typing import Optional, Tuple, List, Dict
 
 import requests
 import pandas as pd
@@ -23,11 +24,11 @@ import altair as alt
 # 定数・設定
 # ==============================
 APP_NAME = "Costly"
-PAGE_TITLE = f"{APP_NAME} | OpenAI 今月のAPI利用料金"
+PAGE_TITLE = f"{APP_NAME} | OpenAI API利用料金"
 PAGE_ICON = "💸"
 
 OPENAI_ADMIN_KEY = st.secrets.get("OPENAI_ADMIN_KEY") or os.getenv("OPENAI_ADMIN_KEY")
-COSTS_URL = "https://api.openai.com/v1/organization/costs"  # Costs API エンドポイント
+COSTS_URL = "https://api.openai.com/v1/organization/costs"  # Costs API
 TOKYO = tz.gettz("Asia/Tokyo")
 RATE_CACHE_PATH = Path(".rate_cache.json")
 
@@ -37,18 +38,18 @@ HEADERS = {
 }
 
 # ==============================
-# 為替レート周り（フォールバック + キャッシュ）
+# 為替レート（フォールバック + キャッシュ）
 # ==============================
-def _save_rate_cache(rate: float):
+def _save_rate_cache(rate: float) -> None:
     try:
-        RATE_CACHE_PATH.write_text(json.dumps({
-            "rate": float(rate),
-            "saved_at_utc": datetime.utcnow().isoformat()
-        }, ensure_ascii=False))
+        RATE_CACHE_PATH.write_text(json.dumps(
+            {"rate": float(rate), "saved_at_utc": datetime.utcnow().isoformat()},
+            ensure_ascii=False
+        ))
     except Exception:
         pass
 
-def _load_rate_cache() -> tuple[float | None, str | None]:
+def _load_rate_cache() -> Tuple[Optional[float], Optional[str]]:
     try:
         obj = json.loads(RATE_CACHE_PATH.read_text())
         return float(obj.get("rate")), obj.get("saved_at_utc")
@@ -56,12 +57,7 @@ def _load_rate_cache() -> tuple[float | None, str | None]:
         return None, None
 
 @st.cache_data(ttl=60 * 10)
-def fetch_usd_jpy_rate() -> tuple[float | None, str]:
-    """
-    為替レートを複数プロバイダで順番に取得。
-    成功: (rate, "live")
-    失敗: (キャッシュorNone, "cache" / "none")
-    """
+def fetch_usd_jpy_rate() -> Tuple[Optional[float], str]:
     providers = [
         ("exchangerate.host", "https://api.exchangerate.host/latest", {"base": "USD", "symbols": "JPY"},
          lambda j: j["rates"]["JPY"]),
@@ -69,7 +65,7 @@ def fetch_usd_jpy_rate() -> tuple[float | None, str]:
          lambda j: j["rates"]["JPY"]),
         ("open.er-api.com", "https://open.er-api.com/v6/latest/USD", {}, lambda j: j["rates"]["JPY"]),
     ]
-    for name, url, params, pick in providers:
+    for _, url, params, pick in providers:
         try:
             r = requests.get(url, params=params, timeout=8)
             r.raise_for_status()
@@ -78,9 +74,7 @@ def fetch_usd_jpy_rate() -> tuple[float | None, str]:
             return rate, "live"
         except Exception:
             continue
-
-    # ここまで失敗 → キャッシュを試す
-    cached, saved_at = _load_rate_cache()
+    cached, _ = _load_rate_cache()
     if cached:
         return cached, "cache"
     return None, "none"
@@ -88,179 +82,289 @@ def fetch_usd_jpy_rate() -> tuple[float | None, str]:
 # ==============================
 # 期間ユーティリティ
 # ==============================
-def month_range_tokyo() -> tuple[int, int]:
-    """東京時刻の月初00:00と翌月初00:00をUTCのUNIX秒で返す"""
-    now_tokyo = datetime.now(TOKYO)
-    start_tokyo = now_tokyo.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    next_month = (
-        start_tokyo.replace(year=start_tokyo.year + 1, month=1)
-        if start_tokyo.month == 12
-        else start_tokyo.replace(month=start_tokyo.month + 1)
-    )
-    start_utc = start_tokyo.astimezone(timezone.utc)
-    end_utc = next_month.astimezone(timezone.utc)
-    return int(start_utc.timestamp()), int(end_utc.timestamp())
+def first_day(dt: date) -> datetime:
+    return datetime(dt.year, dt.month, 1, 0, 0, 0, tzinfo=TOKYO)
 
-def call_costs_api(start_ts: int, end_ts: int | None = None, limit: int = 45) -> list[dict]:
-    """Costs APIをページングしつつ取得（日次バケット）"""
+def next_month_start(dt: date) -> datetime:
+    start = first_day(dt)
+    return (start + relativedelta.relativedelta(months=1))
+
+def to_unix_utc(dt_tokyo: datetime) -> int:
+    return int(dt_tokyo.astimezone(timezone.utc).timestamp())
+
+def month_range_current() -> Tuple[int, int]:
+    now_tokyo = datetime.now(TOKYO)
+    start_tokyo = first_day(now_tokyo.date())
+    end_tokyo = next_month_start(now_tokyo.date())
+    return to_unix_utc(start_tokyo), to_unix_utc(end_tokyo)
+
+def month_range_from_months(start_month: date, end_month: date) -> Tuple[int, int]:
+    """開始月はその月初、終了月は『翌月初』までを範囲にする"""
+    start_tokyo = first_day(start_month)
+    end_tokyo = next_month_start(end_month)
+    return to_unix_utc(start_tokyo), to_unix_utc(end_tokyo)
+
+# ==============================
+# Costs API
+# ==============================
+@st.cache_data(ttl=60 * 5)
+def call_costs_api(start_ts: int, end_ts: Optional[int] = None, limit: int = 90) -> List[Dict]:
+    """日次バケットでページング取得（Python側で月次集計する設計）"""
     params = {"start_time": start_ts, "bucket_width": "1d", "limit": limit}
     if end_ts:
         params["end_time"] = end_ts
 
-    all_buckets, page_cursor = [], None
+    all_buckets: List[Dict] = []
+    page: Optional[str] = None
     while True:
         p = params.copy()
-        if page_cursor:
-            p["page"] = page_cursor
+        if page:
+            p["page"] = page
         resp = requests.get(COSTS_URL, headers=HEADERS, params=p, timeout=30)
         if resp.status_code in (401, 403):
             raise PermissionError("Costs API へのアクセスが拒否されました。Admin Key（読み取り専用）が必要です。")
         resp.raise_for_status()
         payload = resp.json()
         all_buckets.extend(payload.get("data", []))
-        next_page = payload.get("next_page")
-        if not (payload.get("has_more") and next_page):
+        if not (payload.get("has_more") and payload.get("next_page")):
             break
-        page_cursor = next_page
-        time.sleep(0.5)  # レートリミット配慮
+        page = payload.get("next_page")
+        time.sleep(0.5)
     return all_buckets
 
-def to_dataframe(buckets: list[dict]) -> pd.DataFrame:
-    """バケット配列 → 日別USD合計のDataFrame"""
+def to_daily_df(buckets: List[Dict]) -> pd.DataFrame:
     rows = []
     for b in buckets:
         start_dt_utc = datetime.fromtimestamp(b["start_time"], tz=timezone.utc)
-        date_jst = start_dt_utc.astimezone(TOKYO).date().isoformat()
+        date_jst = start_dt_utc.astimezone(TOKYO).date()
         usd = 0.0
         for r in b.get("results", []):
             amt = r.get("amount", {}).get("value")
             curr = (r.get("amount", {}).get("currency") or "usd").lower()
             if amt is not None and curr == "usd":
                 usd += float(amt)
-        rows.append({"date": date_jst, "cost_usd": round(usd, 6)})
-    return pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+        rows.append({"date": pd.to_datetime(date_jst), "cost_usd": round(usd, 6)})
+    df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+    return df
+
+def to_monthly_df(df_daily: pd.DataFrame) -> pd.DataFrame:
+    """日別DFを月別サマリ DataFrame に変換（必ず DataFrame を返す）"""
+    if df_daily.empty:
+        # 空でも列型が明確なDFを返す
+        return pd.DataFrame({"month": pd.Series(dtype="string"),
+                             "cost_usd": pd.Series(dtype="float")})
+    df = df_daily.copy()
+    df["month"] = df["date"].dt.to_period("M").astype(str)  # 'YYYY-MM'
+    # ← 修正ポイント：Series にならないように DataFrame で集計
+    dfm = df.groupby("month", as_index=False, sort=True).agg(cost_usd=("cost_usd", "sum"))
+    return dfm
 
 # ==============================
 # UI
 # ==============================
 st.set_page_config(page_title=PAGE_TITLE, page_icon=PAGE_ICON, layout="centered")
 st.title(APP_NAME)
-st.caption("OpenAI 今月のAPI利用料金ダッシュボード")
+st.caption("OpenAI API利用料金ダッシュボード（今月＋履歴）")
 
 with st.expander("設定 / オプション", expanded=False):
+    period_mode = st.radio("集計範囲", ["今月", "任意の期間"], index=0, horizontal=True)
     manual_rate = st.number_input(
-        "円換算レート（空欄=自動取得・フォールバック/キャッシュ）",
+        "円換算レート（未入力=自動/フォールバック/キャッシュ）",
         min_value=0.0, value=0.0, step=0.01,
-        help="未入力または0なら自動で複数API→キャッシュの順に取得します。"
+        help="自動取得に失敗時はキャッシュ→警告。必要ならここで手動入力。"
     )
-    show_table = st.checkbox("日別明細テーブルを表示", value=True)
-    show_chart = st.checkbox("日別推移チャートを表示", value=True)
+    show_daily = st.checkbox("日別タブを表示", value=True)
+    show_monthly = st.checkbox("月別タブを表示", value=True)
 
-# Key チェック
 if not OPENAI_ADMIN_KEY:
-    st.error("OPENAI_ADMIN_KEY が設定されていません。.streamlit/secrets.toml または環境変数に Admin Key（読み取り専用）を設定してください。")
+    st.error("OPENAI_ADMIN_KEY が設定されていません（.streamlit/secrets.toml 推奨）。")
     st.stop()
+
+# 期間決定
+if period_mode == "今月":
+    start_ts, end_ts = month_range_current()
+    range_label = "今月"
+    start_month_disp = pd.to_datetime(datetime.fromtimestamp(start_ts, tz=timezone.utc)).tz_convert(TOKYO).strftime("%Y-%m")
+    end_month_disp_dt = pd.to_datetime(datetime.fromtimestamp(end_ts, tz=timezone.utc)).tz_convert(TOKYO) - pd.offsets.Day(1)
+    end_month_disp = end_month_disp_dt.strftime("%Y-%m")
+else:
+    today = datetime.now(TOKYO).date()
+    default_start = (today.replace(day=1) - relativedelta.relativedelta(months=5))
+    default_end = today.replace(day=1)
+    c1, c2 = st.columns(2)
+    start_month_pick = c1.date_input("開始月", value=default_start, help="月初で扱います。日付は自動的に1日に補正。")
+    end_month_pick = c2.date_input("終了月", value=default_end, help="この月の末日まで含めます（内部的には翌月初の手前まで）。")
+    # 安全補正：日付の月初に寄せる
+    start_month_pick = date(start_month_pick.year, start_month_pick.month, 1)
+    end_month_pick = date(end_month_pick.year, end_month_pick.month, 1)
+    if start_month_pick > end_month_pick:
+        st.error("開始月が終了月より後になっています。")
+        st.stop()
+    start_ts, end_ts = month_range_from_months(start_month_pick, end_month_pick)
+    range_label = f"{start_month_pick.strftime('%Y-%m')} 〜 {end_month_pick.strftime('%Y-%m')}"
+    start_month_disp = start_month_pick.strftime("%Y-%m")
+    end_month_disp = end_month_pick.strftime("%Y-%m")
 
 # データ取得
 try:
-    start_ts, end_ts = month_range_tokyo()
     buckets = call_costs_api(start_ts=start_ts, end_ts=end_ts)
-    df = to_dataframe(buckets)
-    month_total_usd = float(df["cost_usd"].sum()) if not df.empty else 0.0
+    df_daily = to_daily_df(buckets)
+    df_month = to_monthly_df(df_daily)
 except PermissionError as e:
     st.error(str(e))
-    st.info("Admin Key の発行方法を確認してください。")
     st.stop()
 except requests.HTTPError as e:
-    st.error(f"Costs API 呼び出しでエラーが発生しました: {e}")
+    st.error(f"Costs API 呼び出しエラー: {e}")
     st.stop()
 except Exception as e:
     st.error(f"予期せぬエラー: {e}")
     st.stop()
 
-# 為替レート
-rate_source_note = ""
+# 為替
+rate_note = ""
 if manual_rate and manual_rate > 0:
     rate, source = manual_rate, "manual"
 else:
     rate, source = fetch_usd_jpy_rate()
 
 if source == "live":
-    rate_source_note = "（ライブ取得）"
+    rate_note = "（ライブ取得）"
 elif source == "cache":
     _, saved_at = _load_rate_cache()
-    jst_time = ""
+    jst_text = ""
     if saved_at:
         try:
-            jst_time = datetime.fromisoformat(saved_at).astimezone(TOKYO).strftime("%Y-%m-%d %H:%M")
+            jst_text = datetime.fromisoformat(saved_at).astimezone(TOKYO).strftime("%Y-%m-%d %H:%M")
         except Exception:
             pass
-    st.info(f"為替レートは直近キャッシュを使用中{f'（{jst_time} JST 保存）' if jst_time else ''}。ネット到達性に問題がある可能性があります。")
+    st.info(f"為替レートはキャッシュを使用中{('（'+jst_text+' JST 保存）') if jst_text else ''}。ネット到達性に問題がある可能性があります。")
 elif source == "none":
-    st.warning("為替レートの取得に失敗しました（キャッシュも無し）。必要に応じて手動レートを入力してください。")
+    st.warning("為替レートの取得に失敗（キャッシュなし）。必要に応じて手動レートを入力してください。")
 
-# JPY換算
-yen_total = math.floor(month_total_usd * rate) if (rate and month_total_usd) else None
+# 集計値
+total_usd = float(df_daily["cost_usd"].sum()) if not df_daily.empty else 0.0
+total_jpy = (math.floor(total_usd * rate) if rate else None)
 
-# 見出し・メトリクス
-today_jst = datetime.now(TOKYO)
-st.subheader(f"{today_jst.strftime('%Y-%m')} の累計")
-c1, c2, c3 = st.columns(3)
-c1.metric("今月合計 (USD)", f"${month_total_usd:,.2f}")
-if rate:
-    c2.metric("今月合計 (JPY)", f"¥{yen_total:,.0f}", help=f"レート: {rate:.3f} JPY/USD {rate_source_note}")
-else:
-    c2.metric("今月合計 (JPY)", "—", help="レート未取得（手動入力可）")
-avg_per_day = (month_total_usd / max(len(df), 1)) if not df.empty else 0.0
-c3.metric("1日平均 (USD)", f"${avg_per_day:,.2f}")
+st.subheader(f"集計期間：{range_label}")
+m1, m2, m3 = st.columns(3)
+m1.metric("合計 (USD)", f"${total_usd:,.2f}")
+m2.metric("合計 (JPY)", f"¥{total_jpy:,.0f}" if rate else "—", help=(f"レート: {rate:.3f} JPY/USD {rate_note}" if rate else "手動入力可"))
+avg_day = (total_usd / max(len(df_daily), 1)) if not df_daily.empty else 0.0
+m3.metric("日平均 (USD)", f"${avg_day:,.2f}")
 
-st.caption("※ 東京時間の月初〜翌月初(未満)で集計。Costs API は日次バケットで返却されます。")
+st.caption("※ 東京時間の月初/翌月初で範囲を切り、Costs APIの日次バケットをPython側で集計しています。")
 
-# cost_jpy 列を追加（レートがあれば）
-df_display = df.copy()
-if rate:
-    df_display["cost_jpy"] = (df_display["cost_usd"] * rate).apply(lambda x: math.floor(x))
-else:
-    df_display["cost_jpy"] = None
+# cost_jpy列を追加
+def add_jpy(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if rate:
+        out["cost_jpy"] = (out["cost_usd"] * rate).apply(lambda x: math.floor(x))
+    else:
+        out["cost_jpy"] = None
+    return out
 
-# ① グラフ（Altairで縦軸ラベル）
-if show_chart and not df.empty:
-    df_chart = df.copy()
-    df_chart["date"] = pd.to_datetime(df_chart["date"])
-    chart = (
-        alt.Chart(df_chart)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("date:T", title="Date (JST)"),
-            y=alt.Y("cost_usd:Q", title="USD ($)"),
-            tooltip=[
-                alt.Tooltip("date:T", title="Date"),
-                alt.Tooltip("cost_usd:Q", title="Cost (USD)", format="$.2f"),
-            ],
-        )
-        .properties(height=220)
-    )
-    st.altair_chart(chart, use_container_width=True)
+tabs = []
+if show_monthly:
+    tabs.append("月別")
+if show_daily:
+    tabs.append("日別")
+if not tabs:
+    tabs = ["月別", "日別"]
 
-# ② テーブル（USD/JPY 両方表示）
-if show_table:
-    try:
-        st.dataframe(
-            df_display,
-            use_container_width=True,
-            column_config={
-                "date": st.column_config.TextColumn("date"),
-                "cost_usd": st.column_config.NumberColumn("cost_usd ($)", format="$%.2f"),
-                "cost_jpy": st.column_config.NumberColumn("cost_jpy (¥)", format="¥%d"),
-            },
-        )
-    except Exception:
-        # 古いStreamlitで column_config が無い場合
-        st.dataframe(df_display, use_container_width=True)
+t_objs = st.tabs(tabs)
 
-with st.expander("APIレスポンス / 状態（デバッグ）", expanded=False):
+# --- 月別タブ ---
+if "月別" in tabs:
+    idx = tabs.index("月別")
+    with t_objs[idx]:
+        dfm_disp = add_jpy(df_month)
+        st.markdown("#### 月別サマリ")
+        if not dfm_disp.empty:
+            # Chart
+            chart_m = (
+                alt.Chart(dfm_disp)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("month:N", title="Month"),
+                    y=alt.Y("cost_usd:Q", title="USD ($)"),
+                    tooltip=[alt.Tooltip("month:N", title="Month"),
+                             alt.Tooltip("cost_usd:Q", title="Cost (USD)", format="$.2f")]
+                ).properties(height=220)
+            )
+            st.altair_chart(chart_m, use_container_width=True)
+            # Table
+            try:
+                st.dataframe(
+                    dfm_disp,
+                    use_container_width=True,
+                    column_config={
+                        "month": st.column_config.TextColumn("month"),
+                        "cost_usd": st.column_config.NumberColumn("cost_usd ($)", format="$%.2f"),
+                        "cost_jpy": st.column_config.NumberColumn("cost_jpy (¥)", format="¥%d"),
+                    },
+                )
+            except Exception:
+                st.dataframe(dfm_disp, use_container_width=True)
+
+            # CSV
+            csv_m = dfm_disp.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "月別CSVをダウンロード",
+                data=csv_m,
+                file_name=f"costly_monthly_{start_month_disp}_to_{end_month_disp}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        else:
+            st.info("この期間にはデータがありません。")
+
+# --- 日別タブ ---
+if "日別" in tabs:
+    idx = tabs.index("日別")
+    with t_objs[idx]:
+        dfd_disp = add_jpy(df_daily)
+        st.markdown("#### 日別明細")
+        if not dfd_disp.empty:
+            # Chart
+            chart_d = (
+                alt.Chart(dfd_disp)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("date:T", title="Date (JST)"),
+                    y=alt.Y("cost_usd:Q", title="USD ($)"),
+                    tooltip=[alt.Tooltip("date:T", title="Date"),
+                             alt.Tooltip("cost_usd:Q", title="Cost (USD)", format="$.2f")]
+                ).properties(height=220)
+            )
+            st.altair_chart(chart_d, use_container_width=True)
+            # Table
+            try:
+                st.dataframe(
+                    dfd_disp,
+                    use_container_width=True,
+                    column_config={
+                        "date": st.column_config.DatetimeColumn("date"),
+                        "cost_usd": st.column_config.NumberColumn("cost_usd ($)", format="$%.2f"),
+                        "cost_jpy": st.column_config.NumberColumn("cost_jpy (¥)", format="¥%d"),
+                    },
+                )
+            except Exception:
+                st.dataframe(dfd_disp, use_container_width=True)
+
+            # CSV
+            csv_d = dfd_disp.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "日別CSVをダウンロード",
+                data=csv_d,
+                file_name=f"costly_daily_{start_month_disp}_to_{end_month_disp}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        else:
+            st.info("この期間にはデータがありません。")
+
+with st.expander("デバッグ情報", expanded=False):
     st.json({
-        "start_time_utc": start_ts, "end_time_utc": end_ts,
-        "buckets_count": len(buckets),
-        "fx_rate": rate, "fx_source": source
+        "range_start_ts": start_ts, "range_end_ts": end_ts,
+        "daily_rows": len(df_daily), "monthly_rows": len(df_month),
     })
