@@ -2,8 +2,8 @@
 """
 Costly — OpenAI API利用料金ダッシュボード（履歴対応版）
 - 期間選択: 今月 / 任意の期間（開始月〜終了月）
-- タブ: 月別 / 日別
-- どちらも USDグラフ(縦軸ラベルつき), cost_jpy列, CSVダウンロード
+- 表示モード: 日別明細（デフォルト） / 月別サマリ（ラジオで切替）
+- USDグラフ(縦軸ラベルつき), cost_jpy列, CSVダウンロード
 """
 
 import os
@@ -150,12 +150,10 @@ def to_daily_df(buckets: List[Dict]) -> pd.DataFrame:
 def to_monthly_df(df_daily: pd.DataFrame) -> pd.DataFrame:
     """日別DFを月別サマリ DataFrame に変換（必ず DataFrame を返す）"""
     if df_daily.empty:
-        # 空でも列型が明確なDFを返す
         return pd.DataFrame({"month": pd.Series(dtype="string"),
                              "cost_usd": pd.Series(dtype="float")})
     df = df_daily.copy()
     df["month"] = df["date"].dt.to_period("M").astype(str)  # 'YYYY-MM'
-    # ← 修正ポイント：Series にならないように DataFrame で集計
     dfm = df.groupby("month", as_index=False, sort=True).agg(cost_usd=("cost_usd", "sum"))
     return dfm
 
@@ -173,8 +171,8 @@ with st.expander("設定 / オプション", expanded=False):
         min_value=0.0, value=0.0, step=0.01,
         help="自動取得に失敗時はキャッシュ→警告。必要ならここで手動入力。"
     )
-    show_daily = st.checkbox("日別タブを表示", value=True)
-    show_monthly = st.checkbox("月別タブを表示", value=True)
+    # ✅ 単一のラジオで表示モード切替（デフォルトは「日別明細」）
+    display_mode = st.radio("表示モード", ["日別明細", "月別サマリ"], index=0, horizontal=True)
 
 if not OPENAI_ADMIN_KEY:
     st.error("OPENAI_ADMIN_KEY が設定されていません（.streamlit/secrets.toml 推奨）。")
@@ -254,7 +252,7 @@ m3.metric("日平均 (USD)", f"${avg_day:,.2f}")
 
 st.caption("※ 東京時間の月初/翌月初で範囲を切り、Costs APIの日次バケットをPython側で集計しています。")
 
-# cost_jpy列を追加
+# 共通: JPY列を付与
 def add_jpy(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if rate:
@@ -263,105 +261,88 @@ def add_jpy(df: pd.DataFrame) -> pd.DataFrame:
         out["cost_jpy"] = None
     return out
 
-tabs = []
-if show_monthly:
-    tabs.append("月別")
-if show_daily:
-    tabs.append("日別")
-if not tabs:
-    tabs = ["月別", "日別"]
+# ==============================
+# 表示モード：日別 or 月別
+# ==============================
+if display_mode == "月別サマリ":
+    dfm_disp = add_jpy(df_month)
+    st.markdown("#### 月別サマリ")
+    if not dfm_disp.empty:
+        chart_m = (
+            alt.Chart(dfm_disp)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("month:N", title="Month"),
+                y=alt.Y("cost_usd:Q", title="USD ($)"),
+                tooltip=[alt.Tooltip("month:N", title="Month"),
+                         alt.Tooltip("cost_usd:Q", title="Cost (USD)", format="$.2f")]
+            ).properties(height=220)
+        )
+        st.altair_chart(chart_m, use_container_width=True)
 
-t_objs = st.tabs(tabs)
-
-# --- 月別タブ ---
-if "月別" in tabs:
-    idx = tabs.index("月別")
-    with t_objs[idx]:
-        dfm_disp = add_jpy(df_month)
-        st.markdown("#### 月別サマリ")
-        if not dfm_disp.empty:
-            # Chart
-            chart_m = (
-                alt.Chart(dfm_disp)
-                .mark_line(point=True)
-                .encode(
-                    x=alt.X("month:N", title="Month"),
-                    y=alt.Y("cost_usd:Q", title="USD ($)"),
-                    tooltip=[alt.Tooltip("month:N", title="Month"),
-                             alt.Tooltip("cost_usd:Q", title="Cost (USD)", format="$.2f")]
-                ).properties(height=220)
-            )
-            st.altair_chart(chart_m, use_container_width=True)
-            # Table
-            try:
-                st.dataframe(
-                    dfm_disp,
-                    use_container_width=True,
-                    column_config={
-                        "month": st.column_config.TextColumn("month"),
-                        "cost_usd": st.column_config.NumberColumn("cost_usd ($)", format="$%.2f"),
-                        "cost_jpy": st.column_config.NumberColumn("cost_jpy (¥)", format="¥%d"),
-                    },
-                )
-            except Exception:
-                st.dataframe(dfm_disp, use_container_width=True)
-
-            # CSV
-            csv_m = dfm_disp.to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                "月別CSVをダウンロード",
-                data=csv_m,
-                file_name=f"costly_monthly_{start_month_disp}_to_{end_month_disp}.csv",
-                mime="text/csv",
+        try:
+            st.dataframe(
+                dfm_disp,
                 use_container_width=True,
+                column_config={
+                    "month": st.column_config.TextColumn("month"),
+                    "cost_usd": st.column_config.NumberColumn("cost_usd ($)", format="$%.2f"),
+                    "cost_jpy": st.column_config.NumberColumn("cost_jpy (¥)", format="¥%d"),
+                },
             )
-        else:
-            st.info("この期間にはデータがありません。")
+        except Exception:
+            st.dataframe(dfm_disp, use_container_width=True)
 
-# --- 日別タブ ---
-if "日別" in tabs:
-    idx = tabs.index("日別")
-    with t_objs[idx]:
-        dfd_disp = add_jpy(df_daily)
-        st.markdown("#### 日別明細")
-        if not dfd_disp.empty:
-            # Chart
-            chart_d = (
-                alt.Chart(dfd_disp)
-                .mark_line(point=True)
-                .encode(
-                    x=alt.X("date:T", title="Date (JST)"),
-                    y=alt.Y("cost_usd:Q", title="USD ($)"),
-                    tooltip=[alt.Tooltip("date:T", title="Date"),
-                             alt.Tooltip("cost_usd:Q", title="Cost (USD)", format="$.2f")]
-                ).properties(height=220)
-            )
-            st.altair_chart(chart_d, use_container_width=True)
-            # Table
-            try:
-                st.dataframe(
-                    dfd_disp,
-                    use_container_width=True,
-                    column_config={
-                        "date": st.column_config.DatetimeColumn("date"),
-                        "cost_usd": st.column_config.NumberColumn("cost_usd ($)", format="$%.2f"),
-                        "cost_jpy": st.column_config.NumberColumn("cost_jpy (¥)", format="¥%d"),
-                    },
-                )
-            except Exception:
-                st.dataframe(dfd_disp, use_container_width=True)
+        csv_m = dfm_disp.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "月別CSVをダウンロード",
+            data=csv_m,
+            file_name=f"costly_monthly_{start_month_disp}_to_{end_month_disp}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    else:
+        st.info("この期間にはデータがありません。")
 
-            # CSV
-            csv_d = dfd_disp.to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                "日別CSVをダウンロード",
-                data=csv_d,
-                file_name=f"costly_daily_{start_month_disp}_to_{end_month_disp}.csv",
-                mime="text/csv",
+else:
+    dfd_disp = add_jpy(df_daily)
+    st.markdown("#### 日別明細")
+    if not dfd_disp.empty:
+        chart_d = (
+            alt.Chart(dfd_disp)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("date:T", title="Date (JST)"),
+                y=alt.Y("cost_usd:Q", title="USD ($)"),
+                tooltip=[alt.Tooltip("date:T", title="Date"),
+                         alt.Tooltip("cost_usd:Q", title="Cost (USD)", format="$.2f")]
+            ).properties(height=220)
+        )
+        st.altair_chart(chart_d, use_container_width=True)
+
+        try:
+            st.dataframe(
+                dfd_disp,
                 use_container_width=True,
+                column_config={
+                    "date": st.column_config.DatetimeColumn("date"),
+                    "cost_usd": st.column_config.NumberColumn("cost_usd ($)", format="$%.2f"),
+                    "cost_jpy": st.column_config.NumberColumn("cost_jpy (¥)", format="¥%d"),
+                },
             )
-        else:
-            st.info("この期間にはデータがありません。")
+        except Exception:
+            st.dataframe(dfd_disp, use_container_width=True)
+
+        csv_d = dfd_disp.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "日別CSVをダウンロード",
+            data=csv_d,
+            file_name=f"costly_daily_{start_month_disp}_to_{end_month_disp}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    else:
+        st.info("この期間にはデータがありません。")
 
 with st.expander("デバッグ情報", expanded=False):
     st.json({
